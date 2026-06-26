@@ -3,42 +3,59 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from app.chains.chatbot import create_chain
+from app.chains.chatbot import create_agent
 from app.memory.store import clear_session, get_history, get_or_create_memory
 from app.schemas import ChatRequest, ChatResponse, HistoryResponse
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
-
 @router.post("/", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Send a message and receive a reply.
-
-    When ``stream=True`` the response is a ``text/plain`` stream of tokens
-    instead of the standard JSON envelope.
-    """
     try:
         memory = get_or_create_memory(req.session_id)
-        chain = create_chain(memory)
+        agent = create_agent()
+        
+        # Safely convert messages from Redis for langgraph compatibility
+        history_messages = []
+        for msg in memory.chat_memory.messages:
+            if isinstance(msg, dict):
+                role = "user" if msg.get("type") == "human" or msg.get("role") == "human" else "assistant"
+                content = msg.get("content", "")
+            else:
+                role = "user" if getattr(msg, "type", "") == "human" else "assistant"
+                content = getattr(msg, "content", "")
+            history_messages.append((role, content))
+        
+        messages_input = history_messages + [("user", req.message)]
 
         if req.stream:
-            # Stream tokens one-by-one for a polished, real-time UX
             async def token_generator():
-                async for chunk in chain.astream(
-                    {"input": req.message}
+                final_content = ""
+                async for event in agent.astream_events(
+                    {"messages": messages_input},
+                    version="v2"
                 ):
-                    if "response" in chunk:
-                        yield chunk["response"]
+                    kind = event["event"]
+                    if kind == "on_chat_model_stream":
+                        chunk = event["data"]["chunk"]
+                        # Filter out tool_calls from final output
+                        if chunk.content and not chunk.tool_call_chunks:
+                            final_content += chunk.content
+                            yield chunk.content
+                
+                # Save to redis memory manually after streaming ends
+                memory.save_context({"input": req.message}, {"output": final_content})
 
             return StreamingResponse(token_generator(), media_type="text/plain")
 
         # Standard JSON response
-        result = await chain.ainvoke(
-            {"input": req.message}
-        )
+        result = await agent.ainvoke({"messages": messages_input})
+        final_output = result["messages"][-1].content
+        memory.save_context({"input": req.message}, {"output": final_output})
+        
         return ChatResponse(
             session_id=req.session_id,
-            reply=result["response"],
+            reply=final_output,
         )
 
     except Exception as e:
