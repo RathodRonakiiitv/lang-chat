@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     openai_api_key: str
     openai_base_url: str = "https://integrate.api.nvidia.com/v1"
     redis_url: str = "redis://localhost:6379"
-    model_name: str = "moonshotai/kimi-k2.6"
+    model_name: str = "meta/llama-3.3-70b-instruct"
     max_tokens: int = 1000
     temperature: float = 0.1
 
